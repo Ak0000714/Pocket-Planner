@@ -1,72 +1,80 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
-from flask_sqlalchemy import SQLAlchemy
+import sqlite3
 from datetime import datetime
-import numpy as np 
+import numpy as np
+import os
 
-# Initialize Flask app and database
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql://root:ajmal203@localhost/expenses_tracker'
-app.config['SECRET_KEY'] = 'mysecretkey'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db = SQLAlchemy(app)
+app.secret_key = 'ajmal-expensetrack-key'  # required for flash(), session, etc.
 
-# Define Expense and Budget models
-class Expense(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    category = db.Column(db.String(255), nullable=False)
-    amount = db.Column(db.Float, nullable=False)
-    description = db.Column(db.Text, nullable=True)
-    date = db.Column(db.Date, nullable=False)
 
-class Budget(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    budget = db.Column(db.Float, nullable=False)
+DB_FILE = 'expenses_tracker.db'
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    with get_db_connection() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS expense (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                amount REAL NOT NULL,
+                description TEXT,
+                date DATE NOT NULL
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS budget (
+                id INTEGER PRIMARY KEY,
+                budget REAL NOT NULL
+            )
+        ''')
 
 @app.route('/')
 def index():
     try:
-        page = request.args.get('page', 1, type=int)
-        expenses = Expense.query.paginate(page=page, per_page=10, error_out=False)
-        categories = [category[0] for category in db.session.query(Expense.category).distinct().all()]
-
-        budget_entry = Budget.query.first()
-        budget = budget_entry.budget if budget_entry else 0
-
-        total_expenses = sum(expense.amount for expense in expenses.items)
+        conn = get_db_connection()
+        expenses = conn.execute('SELECT * FROM expense ORDER BY date DESC').fetchall()
+        categories = conn.execute('SELECT DISTINCT category FROM expense').fetchall()
+        category_list = [c['category'] for c in categories]
+        budget_row = conn.execute('SELECT * FROM budget LIMIT 1').fetchone()
+        budget = budget_row['budget'] if budget_row else 0
+        total_expenses = sum([exp['amount'] for exp in expenses])
         balance = budget - total_expenses
 
-        # Prepare data for charts
         category_expenses = []
-        for category in categories:
-            category_expenses.append(
-                sum(expense.amount for expense in Expense.query.filter_by(category=category).all())
-            )
+        for cat in category_list:
+            result = conn.execute('SELECT SUM(amount) AS total FROM expense WHERE category = ?', (cat,)).fetchone()
+            category_expenses.append(result['total'] if result['total'] else 0)
 
-        monthly_expenses = {}
-        for expense in Expense.query.all():
-            month = expense.date.strftime('%B')
-            if month in monthly_expenses:
-                monthly_expenses[month] += expense.amount
-            else:
-                monthly_expenses[month] = expense.amount
+        monthly = {}
+        for exp in expenses:
+            month = datetime.strptime(exp['date'], '%Y-%m-%d').strftime('%B')
+            monthly[month] = monthly.get(month, 0) + exp['amount']
 
-        # Convert monthly_expenses dictionary to lists
-        monthly_expenses_data = {'labels': list(monthly_expenses.keys()), 'values': list(monthly_expenses.values())}
+        monthly_data = {
+            'labels': list(monthly.keys()),
+            'values': list(monthly.values())
+        }
 
-        # Expense Prediction: Use average of past months
-        if monthly_expenses:
-            future_expenses_prediction = np.mean(list(monthly_expenses.values()))  # Simple average
-        else:
-            future_expenses_prediction = 0
+        future_prediction = np.mean(monthly_data['values']) if monthly_data['values'] else 0
 
         return render_template(
-            'index.html', total_expenses=total_expenses, balance=balance, budget=budget,
-            categories=categories, expenses=expenses, category_expenses=category_expenses,
-            monthly_expenses=monthly_expenses_data, future_expenses_prediction=future_expenses_prediction
+            'index.html',
+            expenses=expenses,
+            categories=category_list,
+            total_expenses=total_expenses,
+            balance=balance,
+            budget=budget,
+            category_expenses=category_expenses,
+            monthly_expenses=monthly_data,
+            future_expenses_prediction=future_prediction
         )
-
-    except Exception as e:
-        flash("An error occurred. Please try again.", 'error')
+    except Exception:
+        flash("Error loading page", "error")
         return redirect(url_for('index'))
 
 @app.route('/add', methods=['POST'])
@@ -77,85 +85,82 @@ def add_expense():
         description = request.form.get('description', '')
         date = request.form['date']
 
-        if not amount.replace('.', '', 1).isdigit() or float(amount) <= 0:
-            flash("Invalid amount.", 'error')
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                raise ValueError()
+        except:
+            flash("Invalid amount", "error")
             return redirect(url_for('index'))
 
         try:
-            date = datetime.strptime(date, '%Y-%m-%d')
-        except ValueError:
-            flash("Invalid date format. Use YYYY-MM-DD.", 'error')
+            date_obj = datetime.strptime(date, '%Y-%m-%d')
+        except:
+            flash("Invalid date", "error")
             return redirect(url_for('index'))
 
-        new_expense = Expense(category=category, amount=float(amount), description=description, date=date)
-        db.session.add(new_expense)
-        db.session.commit()
+        conn = get_db_connection()
+        conn.execute(
+            'INSERT INTO expense (category, amount, description, date) VALUES (?, ?, ?, ?)',
+            (category, amount, description, date)
+        )
+        conn.commit()
 
-        # Fetch the current budget and total expenses after adding the new expense
-        budget_entry = Budget.query.first()
-        budget = budget_entry.budget if budget_entry else 0
-        total_expenses = sum(expense.amount for expense in Expense.query.all())
-        
-        # Check if the expenses exceed the budget
-        if total_expenses > budget:
-            flash(f"Warning: Your expenses have exceeded your budget by ₹{total_expenses - budget}.", 'warning')
+        total_spent = conn.execute('SELECT SUM(amount) AS total FROM expense').fetchone()['total']
+        budget_row = conn.execute('SELECT * FROM budget LIMIT 1').fetchone()
+
+        if budget_row and total_spent > budget_row['budget']:
+            flash(f"Warning: You have exceeded the budget by ₹{total_spent - budget_row['budget']}", "warning")
         else:
-            flash('Expense added successfully!')
+            flash("Expense added successfully!", "success")
 
-    except Exception as e:
-        flash("An error occurred while adding the expense.", 'error')
+    except Exception:
+        flash("Error adding expense", "error")
 
     return redirect(url_for('index'))
 
 @app.route('/delete/<int:id>')
 def delete_expense(id):
     try:
-        expense_to_delete = Expense.query.get(id)
-        if expense_to_delete:
-            db.session.delete(expense_to_delete)
-            db.session.commit()
-            flash('Expense deleted successfully!')
-        else:
-            flash('Expense not found.', 'error')
-
-    except Exception as e:
-        flash("An error occurred while deleting the expense.", 'error')
-
+        conn = get_db_connection()
+        conn.execute('DELETE FROM expense WHERE id = ?', (id,))
+        conn.commit()
+        flash("Expense deleted", "success")
+    except:
+        flash("Error deleting expense", "error")
     return redirect(url_for('index'))
 
 @app.route('/update_budget', methods=['POST'])
 def update_budget():
     try:
-        # Get the new budget value from the form
         new_budget = request.form['budget']
-        
-        # Validate the new budget value
-        if not new_budget.replace('.', '', 1).isdigit() or float(new_budget) < 0:
-            flash("Invalid budget amount.", 'error')
+
+        try:
+            new_budget = float(new_budget)
+            if new_budget < 0:
+                raise ValueError()
+        except:
+            flash("Invalid budget value", "error")
             return redirect(url_for('index'))
 
-        # Check if a budget already exists
-        budget_entry = Budget.query.first()
-        
-        # If a budget exists, update it; otherwise, create a new budget entry
-        if budget_entry:
-            budget_entry.budget = float(new_budget)
-            db.session.commit()  # Make sure to commit changes
-            flash('Budget updated successfully!')
+        conn = get_db_connection()
+        existing = conn.execute('SELECT * FROM budget LIMIT 1').fetchone()
+        if existing:
+            conn.execute('UPDATE budget SET budget = ? WHERE id = 1', (new_budget,))
         else:
-            # No existing budget, so create a new one
-            new_budget_entry = Budget(budget=float(new_budget))
-            db.session.add(new_budget_entry)
-            db.session.commit()  # Commit the new entry
-            flash('Budget created successfully!')
+            conn.execute('INSERT INTO budget (id, budget) VALUES (1, ?)', (new_budget,))
+        conn.commit()
+        flash("Budget updated successfully", "success")
 
-    except Exception as e:
-        flash(f"An error occurred while updating the budget: {str(e)}", 'error')
+    except:
+        flash("Error updating budget", "error")
 
     return redirect(url_for('index'))
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
+    if not os.path.exists(DB_FILE):
+        init_db()
+    else:
+        init_db()
 
     app.run(debug=True)
